@@ -6,7 +6,6 @@ from datetime import datetime
 import requests
 import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
 
 # =========================================================
 # LinkedIn Jobs Hunter — v8
@@ -793,30 +792,77 @@ def is_blocked_response(status_code, html):
         if sig in html.lower():         return True, f"Block page ('{sig}')"
     return False, ""
 
+def _tag_text(html_fragment):
+    """Strip all HTML tags and decode common entities."""
+    text = re.sub(r"<[^>]+>", " ", html_fragment or "")
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") \
+               .replace("&nbsp;", " ").replace("&#39;", "'").replace("&quot;", '"')
+    return clean_text(text)
+
+def _attr(tag_html, attr):
+    """Extract an attribute value from a tag string."""
+    m = re.search(rf'{attr}=["\']([^"\']*)["\']', tag_html or "")
+    return m.group(1) if m else ""
+
 def parse_jobs(html, keyword, industry_label, collection):
-    soup = BeautifulSoup(html, "html.parser")
     jobs = []
-    for card in soup.select("li"):
-        title_el   = card.select_one("h3.base-search-card__title") or card.select_one("h3") or card.select_one(".base-search-card__title")
-        company_el = card.select_one("h4.base-search-card__subtitle") or card.select_one(".base-search-card__subtitle")
-        loc_el     = card.select_one(".job-search-card__location") or card.select_one(".base-search-card__metadata")
-        link_el    = card.select_one("a.base-card__full-link") or card.find("a", href=True)
-        time_el    = card.find("time")
-        if not title_el or not link_el: continue
-        title        = clean_text(title_el.get_text(" ", strip=True))
-        company      = clean_text(company_el.get_text(" ", strip=True)) if company_el else ""
-        job_location = clean_text(loc_el.get_text(" ", strip=True)) if loc_el else ""
-        posted_text  = clean_text(time_el.get_text(" ", strip=True)) if time_el else ""
-        posted_raw   = (time_el.get("datetime", "") or posted_text) if time_el else ""
-        url          = link_el.get("href", "").split("?")[0]
-        if not title or not url: continue
-        m = re.search(r"/jobs/view/(\d+)", url)
+    # Split into <li> blocks
+    li_blocks = re.split(r"<li[\s>]", html)
+    for block in li_blocks[1:]:  # skip content before first <li>
+        # Title — h3 with base-search-card__title or just h3
+        title = ""
+        m = re.search(r'<h3[^>]*class="[^"]*base-search-card__title[^"]*"[^>]*>(.*?)</h3>', block, re.S)
+        if not m:
+            m = re.search(r'<h3[^>]*>(.*?)</h3>', block, re.S)
+        if m:
+            title = _tag_text(m.group(1))
+
+        # Company — h4
+        company = ""
+        m = re.search(r'<h4[^>]*class="[^"]*base-search-card__subtitle[^"]*"[^>]*>(.*?)</h4>', block, re.S)
+        if not m:
+            m = re.search(r'<h4[^>]*>(.*?)</h4>', block, re.S)
+        if m:
+            company = _tag_text(m.group(1))
+
+        # Location
+        loc = ""
+        m = re.search(r'<span[^>]*class="[^"]*(?:job-search-card__location|base-search-card__metadata)[^"]*"[^>]*>(.*?)</span>', block, re.S)
+        if m:
+            loc = _tag_text(m.group(1))
+
+        # Link — base-card__full-link or first <a href>
+        url = ""
+        m = re.search(r'<a[^>]*class="[^"]*base-card__full-link[^"]*"[^>]*href="([^"]+)"', block)
+        if not m:
+            m = re.search(r'<a[^>]*href="(https://[^"]*linkedin\.com/jobs/view/[^"]+)"', block)
+        if m:
+            url = m.group(1).split("?")[0]
+
+        # Posted time
+        posted_text = ""
+        posted_raw  = ""
+        m = re.search(r'<time[^>]*>(.*?)</time>', block, re.S)
+        if m:
+            posted_text = _tag_text(m.group(1))
+            dt = re.search(r'datetime="([^"]+)"', block)
+            posted_raw = dt.group(1) if dt else posted_text
+
+        if not title or not url:
+            continue
+
+        job_id_m = re.search(r"/jobs/view/(\d+)", url)
         jobs.append({
-            "Job ID": m.group(1) if m else url,
-            "Title": title, "Company": company, "Location": job_location,
-            "Posted": posted_text, "Posted Date": posted_raw,
-            "Search Keyword": keyword, "Collection": collection,
-            "Industry Filter": industry_label, "URL": url
+            "Job ID":          job_id_m.group(1) if job_id_m else url,
+            "Title":           title,
+            "Company":         company,
+            "Location":        loc,
+            "Posted":          posted_text,
+            "Posted Date":     posted_raw,
+            "Search Keyword":  keyword,
+            "Collection":      collection,
+            "Industry Filter": industry_label,
+            "URL":             url,
         })
     return jobs
 
