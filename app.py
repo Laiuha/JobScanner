@@ -497,7 +497,7 @@ def parse_jobs(html, keyword, industry_label, collection):
         job_id = job_id_match.group(1) if job_id_match else hashlib.md5(url.encode()).hexdigest()[:12]
         jobs.append({
             "Job ID": job_id, "Title": title, "Company": company, "Location": loc,
-            "Posted": posted_text, "Posted Date": posted_raw, "Search Keyword": keyword,
+            "Posted": posted_text, "Posted Date": posted_raw, "Job Title": keyword,
             "Collection": collection, "Industry Filter": industry_label, "URL": url,
         })
     return jobs
@@ -844,16 +844,17 @@ if all_jobs is not None:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Matched", after_filter)
     m2.metric("Total found", before_filter)
-    m3.metric("Best score", int(filtered_df["Match Score"].max()))
+    m3.metric("Collections", filtered_df["Collection"].nunique())
     valid_dates = filtered_df["Posted Parsed"].dropna()
     m4.metric("Newest", valid_dates.iloc[0].strftime("%b %d, %H:%M") if not valid_dates.empty else "N/A")
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(f'<span class="slabel">Results — {sort_mode}</span>', unsafe_allow_html=True)
     display_cols = [
-        "Posted Date", "Posted", "Match Score", "Company", "Location",
-        "Collection", "Search Keyword", "Industry Filter", "URL",
+        "Posted Date", "Posted", "Title", "Company", "Location",
+        "Collection", "Industry Filter", "URL",
     ]
-    st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True)
+    display_df = filtered_df[display_cols].rename(columns={"Title": "Job Title"})
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     st.markdown("<br>", unsafe_allow_html=True)
     top_n = min(15, len(filtered_df))
     st.markdown(f'<span class="slabel">Top {top_n} cards</span>', unsafe_allow_html=True)
@@ -867,7 +868,7 @@ if all_jobs is not None:
         company = esc_text(row["Company"] or "—")
         location_s = esc_text(row["Location"] or "—")
         collection_s = esc_text(row["Collection"])
-        keyword_s = esc_text(row["Search Keyword"])
+        keyword_s = esc_text(row["Title"])
         date_s = esc_text(date_label)
         url = esc_attr(row["URL"])
         st.markdown(
@@ -884,11 +885,9 @@ if all_jobs is not None:
                 <a class="job-link" href="{url}" target="_blank" rel="noopener noreferrer">View on LinkedIn →</a>
               </div>
             </div>
-            <div style="text-align:right;min-width:52px;flex-shrink:0;">
-              <div class="score-num" style="color:{s_color};">{score}</div>
-              <div style="font-size:9px;color:#6a8caa;letter-spacing:0.16em;text-transform:uppercase;margin-top:2px;">score</div>
-            </div>
           </div>
+        </div>
+
         </div>
         """,
             unsafe_allow_html=True,
