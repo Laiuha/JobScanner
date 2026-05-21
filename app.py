@@ -19,7 +19,15 @@ try:
     SEMANTIC_AVAILABLE = True
 except ImportError:
     SEMANTIC_AVAILABLE = False
-# LinkedIn Jobs Hunter — v9.1
+
+try:
+    from sentence_transformers import SentenceTransformer
+    AI_SEMANTIC_AVAILABLE = True
+except ImportError:
+    SentenceTransformer = None
+    AI_SEMANTIC_AVAILABLE = False
+
+# LinkedIn Jobs Hunter — v9.2 — Hybrid AI Search
 st.set_page_config(page_title="Jobs Hunter", page_icon="🔎", layout="wide")
 DB_PATH = Path.home() / ".jobs_hunter.db"
 def utc_now_iso():
@@ -375,11 +383,11 @@ JOB_COLLECTIONS = {
         "industries": ["Human Resources"],
     },
     "🎧 IT": {
-        "keywords": ["Product Manager", "Senior Product Manager", "Product Owner",
-                     "Digital Product Manager", "AI Product Manager", "IT Project Manager",
-                     "Senior Project Manager", "Digital Transformation Manager",
-                     "Technology Consultant", "IT Strategy Consultant", "Business Analyst",
-                     "Functional Consultant", "Enterprise Applications Manager", "AI Consultant"],
+        "keywords": ["Business Analyst", "Product Manager", "Product Owner",
+                     "Project Manager",
+                     "Digital Transformation",
+                     "Business Partner", "Delivery Manager", "IT Director",
+                     "Enterprise Applications", "AI Consultant"],
         "industries": ["Information Technology & Services", "Computer Software", "Internet"],
     },
     "💰 Finance": {
@@ -578,17 +586,29 @@ def score_job_keyword(row, search_terms, include_words, collection_is_set):
         if t in text:
             score -= 20
     return max(0, min(score, 100))
+def build_ai_search_query(query_terms, include_words):
+    # Stronger profile-style query gives the AI matcher more context than a single keyword.
+    parts = query_terms + include_words
+    query = " ".join([p.strip() for p in parts if str(p).strip()])
+    return query.strip()
+
+def build_job_text_series(df):
+    # Keep this lightweight because LinkedIn guest search does not return full job descriptions.
+    return (
+        df["Title"].fillna("") + " | " +
+        df["Company"].fillna("") + " | " +
+        df["Location"].fillna("") + " | " +
+        df["Industry Filter"].fillna("") + " | searched as: " +
+        df["Job Title"].fillna("")
+    )
+
 def score_jobs_semantic(df, query_terms, include_words):
     if df.empty or not SEMANTIC_AVAILABLE:
         return [50] * len(df)
-    query = " ".join(query_terms + include_words).strip()
+    query = build_ai_search_query(query_terms, include_words)
     if not query:
         return [50] * len(df)
-    corpus = (
-        df["Title"].fillna("") + " " +
-        df["Company"].fillna("") + " " +
-        df["Industry Filter"].fillna("")
-    ).tolist()
+    corpus = build_job_text_series(df).tolist()
     try:
         vec = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", min_df=1)
         matrix = vec.fit_transform(corpus + [query])
@@ -596,6 +616,55 @@ def score_jobs_semantic(df, query_terms, include_words):
         return [int(round(max(0.0, min(1.0, s)) * 100)) for s in sims]
     except Exception:
         return [50] * len(df)
+
+@st.cache_resource(show_spinner=False)
+def load_ai_semantic_model():
+    if not AI_SEMANTIC_AVAILABLE:
+        return None
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+def score_jobs_ai_semantic(df, query_terms, include_words):
+    if df.empty or not AI_SEMANTIC_AVAILABLE:
+        return score_jobs_semantic(df, query_terms, include_words)
+    query = build_ai_search_query(query_terms, include_words)
+    if not query:
+        return [50] * len(df)
+    corpus = build_job_text_series(df).tolist()
+    try:
+        model = load_ai_semantic_model()
+        if model is None:
+            return score_jobs_semantic(df, query_terms, include_words)
+        query_emb = model.encode([query], normalize_embeddings=True)
+        job_emb = model.encode(corpus, normalize_embeddings=True)
+        sims = cosine_similarity(query_emb, job_emb).flatten()
+        return [int(round(max(0.0, min(1.0, float(s))) * 100)) for s in sims]
+    except Exception:
+        return score_jobs_semantic(df, query_terms, include_words)
+
+def score_jobs_hybrid_ai(df, query_terms, include_words, collection_is_set):
+    # Full sentence-transformers mode. Can be slow on first run because the model downloads/loads.
+    keyword_scores = df.apply(
+        lambda r: score_job_keyword(r, query_terms, include_words, collection_is_set), axis=1,
+    ).tolist()
+    ai_scores = score_jobs_ai_semantic(df, query_terms, include_words)
+    hybrid_scores = []
+    for kw, ai in zip(keyword_scores, ai_scores):
+        score = int(round((0.35 * kw) + (0.65 * ai)))
+        hybrid_scores.append(max(0, min(score, 100)))
+    return hybrid_scores
+
+def score_jobs_hybrid_fast(df, query_terms, include_words, collection_is_set):
+    # Fast hybrid mode: keyword signal + TF-IDF semantic similarity.
+    # This avoids the Streamlit freeze caused by loading sentence-transformers/torch.
+    keyword_scores = df.apply(
+        lambda r: score_job_keyword(r, query_terms, include_words, collection_is_set), axis=1,
+    ).tolist()
+    semantic_scores = score_jobs_semantic(df, query_terms, include_words)
+    hybrid_scores = []
+    for kw, sem in zip(keyword_scores, semantic_scores):
+        score = int(round((0.55 * kw) + (0.45 * sem)))
+        hybrid_scores.append(max(0, min(score, 100)))
+    return hybrid_scores
 def contains_any(text, words):
     return any(w.lower() in text.lower() for w in words if w) if words else True
 def contains_all(text, words):
@@ -632,9 +701,9 @@ if "request_session" not in st.session_state:
     st.session_state.request_session = make_session()
 st.markdown("""
 <div class="hero">
-  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v9.1 · UAE & Middle East</div>
+  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v9.3 · UAE & Middle East</div>
   <div class="hero-title">Find fresh roles.<br><em>Before everyone else.</em></div>
-  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, semantic scoring, persistent seen-list, in-session caching.</div>
+  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, fast hybrid smart search, optional AI scoring, persistent seen-list, in-session caching.</div>
 </div>
 """, unsafe_allow_html=True)
 seen_count = db_seen_count()
@@ -709,17 +778,23 @@ with st.expander("⚙  Filters & settings"):
     with fe:
         result_location_text = st.text_input("Location contains", value="", placeholder="e.g. Dubai", key="result_location_text")
     with ff:
-        min_score = st.slider("Min match score", 0, 100, 35, key="min_score")
+        min_score = st.slider("Min match score", 0, 100, 45, key="min_score")
     fg, fh, fi = st.columns(3)
     with fg:
         pages = st.slider("Pages per keyword", 1, 5, 2, key="pages")
     with fh:
         delay_mode = st.selectbox("Request delay", list(DELAY_RANGES.keys()), index=1, key="delay_mode")
     with fi:
-        scoring_options = ["Keyword (fast)"]
+        scoring_options = ["Hybrid Smart Search (fast)", "Keyword (fast)"]
         if SEMANTIC_AVAILABLE:
             scoring_options.append("Semantic (TF-IDF)")
-        scoring_mode = st.selectbox("Scoring", scoring_options, index=0, key="scoring_mode")
+        if AI_SEMANTIC_AVAILABLE:
+            scoring_options.append("Hybrid AI Search (slow first run)")
+        scoring_mode = st.selectbox(
+            "Scoring", scoring_options,
+            index=0,
+            key="scoring_mode",
+        )
     fj, fk = st.columns(2)
     with fj:
         hide_seen = st.checkbox("Hide already-seen jobs", value=True, key="hide_seen")
@@ -738,7 +813,9 @@ industry_label = ", ".join(selected_industries)
 if selected_collection == "🎧 IT" and pages > 1:
     st.warning("⚠️ IT collection has many keywords. Consider Slow delay or 1 page to reduce LinkedIn blocks.")
 if not SEMANTIC_AVAILABLE:
-    st.caption("ℹ️ scikit-learn not installed → only keyword scoring. `pip install scikit-learn` for semantic mode.")
+    st.caption("ℹ️ scikit-learn not installed → only keyword scoring. `pip install scikit-learn` for TF-IDF semantic mode.")
+if not AI_SEMANTIC_AVAILABLE:
+    st.caption("ℹ️ sentence-transformers not installed → full AI mode is unavailable, but Fast Hybrid Search still works.")
 st.markdown("<br>", unsafe_allow_html=True)
 def run_search():
     if not keywords:
@@ -803,10 +880,16 @@ if all_jobs is not None:
         st.stop()
     df = pd.DataFrame(all_jobs)
     df["Posted Parsed"] = df["Posted Date"].apply(parse_posted_datetime)
-    if scoring_mode.startswith("Semantic") and SEMANTIC_AVAILABLE:
+    collection_is_set = selected_collection != "Custom search"
+    if scoring_mode.startswith("Hybrid Smart"):
+        # Fast default: no model download, no torch loading, no freezing.
+        df["Match Score"] = score_jobs_hybrid_fast(df, keywords, include_words, collection_is_set)
+    elif scoring_mode.startswith("Hybrid AI") and AI_SEMANTIC_AVAILABLE:
+        with st.spinner("Loading AI model and scoring jobs... first run can take several minutes"):
+            df["Match Score"] = score_jobs_hybrid_ai(df, keywords, include_words, collection_is_set)
+    elif scoring_mode.startswith("Semantic") and SEMANTIC_AVAILABLE:
         df["Match Score"] = score_jobs_semantic(df, keywords, include_words)
     else:
-        collection_is_set = selected_collection != "Custom search"
         df["Match Score"] = df.apply(
             lambda r: score_job_keyword(r, keywords, include_words, collection_is_set), axis=1,
         )
@@ -868,7 +951,7 @@ if all_jobs is not None:
         company = esc_text(row["Company"] or "—")
         location_s = esc_text(row["Location"] or "—")
         collection_s = esc_text(row["Collection"])
-        keyword_s = esc_text(row["Title"])
+        keyword_s = esc_text(row.get("Job Title", ""))
         date_s = esc_text(date_label)
         url = esc_attr(row["URL"])
         st.markdown(
@@ -921,6 +1004,6 @@ elif reapply_clicked:
 st.markdown('<hr class="sdivider">', unsafe_allow_html=True)
 st.markdown(
     '<p style="font-size:10px;color:#a8c8e8;letter-spacing:0.16em;text-transform:uppercase;">'
-    'JOBS HUNTER v9.1 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list</p>',
+    'JOBS HUNTER v9.2 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list</p>',
     unsafe_allow_html=True,
 )
