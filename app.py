@@ -5,6 +5,7 @@ import sqlite3
 import hashlib
 import html
 import urllib.parse
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
@@ -27,7 +28,7 @@ except ImportError:
     SentenceTransformer = None
     AI_SEMANTIC_AVAILABLE = False
 
-# LinkedIn Jobs Hunter — v9.2 — Hybrid AI Search
+# LinkedIn Jobs Hunter — v9.4 — Hugging Face AI Semantic Search
 st.set_page_config(page_title="Jobs Hunter", page_icon="🔎", layout="wide")
 DB_PATH = Path.home() / ".jobs_hunter.db"
 def utc_now_iso():
@@ -617,25 +618,70 @@ def score_jobs_semantic(df, query_terms, include_words):
     except Exception:
         return [50] * len(df)
 
+def get_hf_token():
+    """
+    Optional Hugging Face token support.
+    Put this in .streamlit/secrets.toml:
+    HF_TOKEN = "hf_xxx"
+
+    The public model works without a token, but a token helps on hosted/private environments.
+    """
+    try:
+        token = st.secrets.get("HF_TOKEN", "")
+    except Exception:
+        token = ""
+    token = token or os.environ.get("HF_TOKEN", "")
+    return token.strip()
+
 @st.cache_resource(show_spinner=False)
 def load_ai_semantic_model():
     if not AI_SEMANTIC_AVAILABLE:
         return None
-    return SentenceTransformer("all-MiniLM-L6-v2")
+
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    token = get_hf_token()
+
+    try:
+        if token:
+            return SentenceTransformer(model_name, token=token)
+        return SentenceTransformer(model_name)
+    except TypeError:
+        # Compatibility with older sentence-transformers versions.
+        try:
+            if token:
+                return SentenceTransformer(model_name, use_auth_token=token)
+            return SentenceTransformer(model_name)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 def score_jobs_ai_semantic(df, query_terms, include_words):
     if df.empty or not AI_SEMANTIC_AVAILABLE:
         return score_jobs_semantic(df, query_terms, include_words)
+
     query = build_ai_search_query(query_terms, include_words)
     if not query:
         return [50] * len(df)
+
     corpus = build_job_text_series(df).tolist()
+
     try:
         model = load_ai_semantic_model()
         if model is None:
             return score_jobs_semantic(df, query_terms, include_words)
-        query_emb = model.encode([query], normalize_embeddings=True)
-        job_emb = model.encode(corpus, normalize_embeddings=True)
+
+        query_emb = model.encode(
+            [query],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        job_emb = model.encode(
+            corpus,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=32,
+        )
         sims = cosine_similarity(query_emb, job_emb).flatten()
         return [int(round(max(0.0, min(1.0, float(s))) * 100)) for s in sims]
     except Exception:
@@ -701,9 +747,9 @@ if "request_session" not in st.session_state:
     st.session_state.request_session = make_session()
 st.markdown("""
 <div class="hero">
-  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v9.3 · UAE & Middle East</div>
+  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v9.4 · UAE & Middle East</div>
   <div class="hero-title">Find fresh roles.<br><em>Before everyone else.</em></div>
-  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, fast hybrid smart search, optional AI scoring, persistent seen-list, in-session caching.</div>
+  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, fast hybrid smart search, Hugging Face AI scoring, persistent seen-list, in-session caching.</div>
 </div>
 """, unsafe_allow_html=True)
 seen_count = db_seen_count()
@@ -816,6 +862,9 @@ if not SEMANTIC_AVAILABLE:
     st.caption("ℹ️ scikit-learn not installed → only keyword scoring. `pip install scikit-learn` for TF-IDF semantic mode.")
 if not AI_SEMANTIC_AVAILABLE:
     st.caption("ℹ️ sentence-transformers not installed → full AI mode is unavailable, but Fast Hybrid Search still works.")
+else:
+    hf_token_status = "token found" if get_hf_token() else "no token needed for public model"
+    st.caption(f"🤗 Hugging Face AI search ready · model: all-MiniLM-L6-v2 · {hf_token_status}.")
 st.markdown("<br>", unsafe_allow_html=True)
 def run_search():
     if not keywords:
@@ -1004,6 +1053,6 @@ elif reapply_clicked:
 st.markdown('<hr class="sdivider">', unsafe_allow_html=True)
 st.markdown(
     '<p style="font-size:10px;color:#a8c8e8;letter-spacing:0.16em;text-transform:uppercase;">'
-    'JOBS HUNTER v9.2 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list</p>',
+    'JOBS HUNTER v9.4 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list</p>',
     unsafe_allow_html=True,
 )
