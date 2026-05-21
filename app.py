@@ -981,12 +981,20 @@ if all_jobs is not None:
     m4.metric("Newest", valid_dates.iloc[0].strftime("%b %d, %H:%M") if not valid_dates.empty else "N/A")
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(f'<span class="slabel">Results — {sort_mode}</span>', unsafe_allow_html=True)
-    display_cols = [
-        "Posted Date", "Posted", "Title", "Company", "Location",
-        "Collection", "Industry Filter", "URL",
-    ]
+    display_cols = ["Posted Date", "Posted", "Title", "Company", "Location", "URL"]
     display_df = filtered_df[display_cols].rename(columns={"Title": "Job Title"})
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "URL": st.column_config.LinkColumn(
+                "URL",
+                help="Open job on LinkedIn",
+                display_text="Open LinkedIn",
+            )
+        },
+    )
     st.markdown("<br>", unsafe_allow_html=True)
     top_n = min(15, len(filtered_df))
     st.markdown(f'<span class="slabel">Top {top_n} cards</span>', unsafe_allow_html=True)
