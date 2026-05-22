@@ -419,15 +419,37 @@ LOCATION_OPTIONS = [
 ]
 FRESHNESS_MAP = {
     "Past hour": 3600,
+    "Past 8 hours": 28800,
+    "Past 12 hours": 43200,
     "Past 24 hours": 86400,
     "Past week": 604800,
     "Past month": 2592000,
     "Any time": None,
 }
+FRESHNESS_LABELS = {
+    "Past hour": "Last 1 hour",
+    "Past 8 hours": "Last 8 hours",
+    "Past 12 hours": "Last 12 hours",
+    "Past 24 hours": "Last 24 hours",
+    "Past week": "Last 7 days",
+    "Past month": "Last 30 days",
+    "Any time": "Any time",
+}
 DELAY_RANGES = {
     "Fast (higher block risk)": (0.5, 1.5),
     "Normal": (1.5, 3.5),
     "Slow (fewer blocks)": (3.0, 6.0),
+}
+DELAY_LABELS = {
+    "Fast (higher block risk)": "Quick scan (may get blocked)",
+    "Normal": "Balanced scan",
+    "Slow (fewer blocks)": "Safe scan (recommended)",
+}
+SCORING_LABELS = {
+    "Hybrid Smart Search (fast)": "Smart match — recommended",
+    "Keyword (fast)": "Exact keyword match — fastest",
+    "Semantic (TF-IDF)": "Meaning match — light",
+    "Hybrid AI Search (slow first run)": "AI meaning match — deeper, slower first time",
 }
 def clean_text(value):
     if not value:
@@ -793,7 +815,10 @@ with c2:
     location = st.selectbox("Location", LOCATION_OPTIONS, index=0, key="location_select")
 c3, c4, c5 = st.columns(3)
 with c3:
-    freshness = st.selectbox("Posted within", list(FRESHNESS_MAP.keys()), index=1, key="freshness_select")
+    freshness = st.selectbox(
+        "Job posted", list(FRESHNESS_MAP.keys()), index=3, key="freshness_select",
+        format_func=lambda x: FRESHNESS_LABELS.get(x, x),
+    )
 with c4:
     default_industries = (
         JOB_COLLECTIONS[selected_collection]["industries"]
@@ -813,23 +838,27 @@ st.markdown('<hr class="sdivider">', unsafe_allow_html=True)
 with st.expander("⚙  Filters & settings"):
     fa, fb, fc = st.columns(3)
     with fa:
-        include_text = st.text_input("Must include", value="", placeholder="e.g. AI, ERP", key="include_text")
+        include_text = st.text_input("Show jobs containing", value="", placeholder="e.g. AI, ERP", key="include_text")
     with fb:
-        exclude_text = st.text_input("Exclude words", value="intern, internship, trainee", key="exclude_text")
+        exclude_text = st.text_input("Hide jobs containing", value="intern, internship, trainee", key="exclude_text")
     with fc:
-        require_all = st.checkbox("Require ALL include words", value=False, key="require_all")
+        require_all = st.checkbox("Must contain every word above", value=False, key="require_all")
     fd, fe, ff = st.columns(3)
     with fd:
-        company_text = st.text_input("Company contains", value="", placeholder="e.g. Emirates, G42", key="company_text")
+        company_text = st.text_input("Company name", value="", placeholder="e.g. Emirates, G42", key="company_text")
     with fe:
-        result_location_text = st.text_input("Location contains", value="", placeholder="e.g. Dubai", key="result_location_text")
+        result_location_text = st.text_input("Result location", value="", placeholder="e.g. Dubai", key="result_location_text")
     with ff:
-        min_score = st.slider("Min match score", 0, 100, 45, key="min_score")
+        min_score = st.slider("Minimum relevance", 0, 100, 45, key="min_score")
     fg, fh, fi = st.columns(3)
     with fg:
-        pages = st.slider("Pages per keyword", 1, 5, 2, key="pages")
+        pages = st.slider("Search depth", 1, 5, 1, key="pages", help="1 = safest and fastest. Higher numbers check more LinkedIn pages but increase block risk.")
     with fh:
-        delay_mode = st.selectbox("Request delay", list(DELAY_RANGES.keys()), index=1, key="delay_mode")
+        delay_mode = st.selectbox(
+            "Scan speed", list(DELAY_RANGES.keys()), index=2, key="delay_mode",
+            format_func=lambda x: DELAY_LABELS.get(x, x),
+            help="Safe scan waits longer between LinkedIn searches and reduces block risk.",
+        )
     with fi:
         scoring_options = ["Hybrid Smart Search (fast)", "Keyword (fast)"]
         if SEMANTIC_AVAILABLE:
@@ -837,15 +866,17 @@ with st.expander("⚙  Filters & settings"):
         if AI_SEMANTIC_AVAILABLE:
             scoring_options.append("Hybrid AI Search (slow first run)")
         scoring_mode = st.selectbox(
-            "Scoring", scoring_options,
+            "Matching method", scoring_options,
             index=0,
             key="scoring_mode",
+            format_func=lambda x: SCORING_LABELS.get(x, x),
+            help="Choose how the app decides which jobs are most relevant.",
         )
     fj, fk = st.columns(2)
     with fj:
-        hide_seen = st.checkbox("Hide already-seen jobs", value=True, key="hide_seen")
+        hide_seen = st.checkbox("Hide jobs I already marked as seen", value=True, key="hide_seen")
     with fk:
-        show_diagnostics = st.checkbox("Show diagnostics", value=False, key="diagnostics")
+        show_diagnostics = st.checkbox("Show technical details", value=False, key="diagnostics")
 delay_range = DELAY_RANGES[delay_mode]
 keywords = make_keywords(main_query, extra_queries_text, selected_collection, active_keywords)
 include_words = [x.strip() for x in include_text.split(",") if x.strip()]
@@ -857,7 +888,7 @@ if "Any industry" in selected_industries and len(selected_industries) > 1:
 industry_ids = [INDUSTRY_MAP[x] for x in selected_industries if INDUSTRY_MAP.get(x)]
 industry_label = ", ".join(selected_industries)
 if selected_collection == "🎧 IT" and pages > 1:
-    st.warning("⚠️ IT collection has many keywords. Consider Slow delay or 1 page to reduce LinkedIn blocks.")
+    st.warning("⚠️ IT collection runs many searches. Use Safe scan and Search depth = 1 to reduce LinkedIn blocks.")
 if not SEMANTIC_AVAILABLE:
     st.caption("ℹ️ scikit-learn not installed → only keyword scoring. `pip install scikit-learn` for TF-IDF semantic mode.")
 if not AI_SEMANTIC_AVAILABLE:
@@ -952,7 +983,7 @@ if all_jobs is not None:
     if filtered_df.empty:
         st.warning(
             f"Found {before_filter} jobs but 0 after filters. "
-            "Try lowering min score, removing include words, or unchecking Hide already-seen."
+            "Try lowering Minimum relevance, removing 'Show jobs containing' words, or unchecking 'Hide jobs I already marked as seen'."
         )
         st.dataframe(
             df.sort_values("Posted Parsed", ascending=False, na_position="last")
