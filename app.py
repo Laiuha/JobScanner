@@ -28,7 +28,7 @@ except ImportError:
     SentenceTransformer = None
     AI_SEMANTIC_AVAILABLE = False
 
-# LinkedIn Jobs Hunter — v9.4 — Hugging Face AI Semantic Search
+# LinkedIn Jobs Hunter — v10.3 — Clean AI Pay Evidence
 st.set_page_config(page_title="Jobs Hunter", page_icon="🔎", layout="wide")
 DB_PATH = Path.home() / ".jobs_hunter.db"
 def utc_now_iso():
@@ -655,6 +655,368 @@ def get_hf_token():
     token = token or os.environ.get("HF_TOKEN", "")
     return token.strip()
 
+
+def get_tavily_key():
+    """
+    Optional Tavily key for AI company pay search.
+    Put this in .streamlit/secrets.toml:
+    TAVILY_API_KEY = "tvly_xxx"
+    """
+    try:
+        key = st.secrets.get("TAVILY_API_KEY", "")
+    except Exception:
+        key = ""
+    key = key or os.environ.get("TAVILY_API_KEY", "")
+    return str(key).strip()
+
+
+def normalize_salary_query_text(value):
+    return clean_text(str(value or "")).strip()
+
+
+def short_salary_text(value, max_len=80):
+    """Keep Tavily queries safely below its 400 character query limit."""
+    value = normalize_salary_query_text(value)
+    return value[:max_len].strip()
+
+
+def compact_table_text(value, max_len=80):
+    """Short values only for tables/cards, so results stay readable."""
+    value = clean_text(str(value or ""))
+    if len(value) <= max_len:
+        return value
+    return value[:max_len - 1].rstrip() + "…"
+
+
+def salary_company_search_name(company):
+    """
+    Use stricter company names for generic words.
+    Example: Visa can mean employer Visa Inc or immigration visa.
+    """
+    c = normalize_salary_query_text(company)
+    low = c.lower()
+    aliases = {
+        "visa": "Visa Inc",
+        "meta": "Meta Platforms",
+        "amazon": "Amazon AWS",
+        "aws": "Amazon Web Services",
+        "e&": "e& UAE",
+        "du": "du telecom UAE",
+    }
+    return aliases.get(low, c)
+
+
+def build_pay_search_query(company, title, location):
+    """
+    Tavily has a 400 character query limit.
+    Keep query very short and exact-company focused.
+    """
+    company_s = short_salary_text(salary_company_search_name(company), 45)
+    title_s = short_salary_text(title, 65)
+    location_s = short_salary_text(location, 20)
+
+    # Keep well below 400 chars. Some APIs count encoded/special chars differently.
+    query = f'"{company_s}" "{title_s}" salary {location_s} UAE AED Glassdoor'
+    return compact_table_text(query, 240).replace("…", "")
+
+
+def build_pay_search_query_fallback(company, title):
+    company_s = short_salary_text(salary_company_search_name(company), 45)
+    title_s = short_salary_text(title, 55)
+    query = f'"{company_s}" "{title_s}" salary UAE AED'
+    return compact_table_text(query, 180).replace("…", "")
+
+
+def company_is_generic_word(company):
+    return normalize_salary_query_text(company).lower() in {"visa", "du", "meta", "apple"}
+
+
+def text_matches_company(text, company):
+    """Reject salary snippets that do not clearly refer to the employer."""
+    text_l = clean_text(text).lower()
+    company_l = normalize_salary_query_text(company).lower()
+    search_name_l = salary_company_search_name(company).lower()
+
+    if not company_l:
+        return False
+
+    # Generic company names need stricter matching.
+    if company_is_generic_word(company):
+        if company_l == "visa":
+            return (
+                "visa inc" in text_l or
+                "visa salaries" in text_l or
+                "visa salary" in text_l or
+                "working at visa" in text_l or
+                "visa-" in text_l or
+                "visa/" in text_l
+            )
+        return search_name_l in text_l or f"{company_l} salaries" in text_l
+
+    return company_l in text_l or search_name_l in text_l
+
+
+def has_salary_signal(text):
+    text_l = clean_text(text).lower()
+    salary_words = [
+        "salary", "salaries", "compensation", "pay", "wage",
+        "aed", "dirham", "dhs", "per month", "monthly", "per year", "annually",
+        "glassdoor", "bayt", "gulftalent", "payscale", "salaryexpert", "levels.fyi"
+    ]
+    return any(w in text_l for w in salary_words)
+
+
+def parse_salary_number(raw):
+    """Parse salary numbers such as 35K, 35,000, 4,29,557 into int."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    is_k = bool(re.search(r"[Kk]", raw))
+    cleaned = re.sub(r"[^0-9.]", "", raw)
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except Exception:
+        return None
+    if is_k and value < 1000:
+        value *= 1000
+    return int(round(value))
+
+
+def format_aed_monthly(value):
+    if value is None or value <= 0:
+        return None
+    # Keep it short and readable in tables/cards.
+    if value >= 1000:
+        if value % 1000 == 0:
+            return f"AED {value // 1000}K/mo"
+        return f"AED {value / 1000:.1f}K/mo"
+    return f"AED {value}/mo"
+
+
+def normalize_salary_to_monthly(text):
+    """
+    Convert reliable AED salary mentions into a clean monthly AED display.
+    Examples:
+    - AED 35,000 per month -> AED 35K/mo
+    - AED 420,000 per year -> AED 35K/mo
+    - AED 300,000–420,000 per year -> AED 25K–35K/mo
+
+    Ignores USD/EUR/GBP because exchange rate + compensation context can mislead.
+    """
+    t = clean_text(text)
+    if not t:
+        return None
+
+    # AED range or single value, optionally annual/monthly.
+    patterns = [
+        r"(?:AED|Dhs|د\.إ|dirhams?)\s*([0-9][0-9,\.]*\s*[Kk]?)(?:\s*(?:-|–|to)\s*(?:AED|Dhs|د\.إ|dirhams?)?\s*([0-9][0-9,\.]*\s*[Kk]?))?\s*(?:/|per)?\s*(month|mo|monthly|year|yr|annum|annual|annually)?",
+        r"([0-9][0-9,\.]*\s*[Kk]?)\s*(?:-|–|to)?\s*([0-9][0-9,\.]*\s*[Kk]?)?\s*(?:AED|Dhs|د\.إ|dirhams?)\s*(?:/|per)?\s*(month|mo|monthly|year|yr|annum|annual|annually)?",
+    ]
+
+    candidates = []
+    for pat in patterns:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            n1 = parse_salary_number(m.group(1))
+            n2 = parse_salary_number(m.group(2)) if m.lastindex and m.group(2) else None
+            period = ""
+            # period is last captured group if present
+            try:
+                period = (m.group(m.lastindex) or "").lower() if m.lastindex else ""
+            except Exception:
+                period = ""
+
+            if not n1:
+                continue
+
+            vals = [n1]
+            if n2:
+                vals.append(n2)
+
+            # Detect annual by period or by UAE salary size. Anything above 100K AED is likely yearly.
+            is_annual = any(w in period for w in ["year", "yr", "annum", "annual", "annually"]) or max(vals) >= 100000
+            is_monthly = any(w in period for w in ["month", "mo", "monthly"]) or max(vals) < 100000
+
+            if is_annual:
+                vals = [int(round(v / 12)) for v in vals]
+            elif not is_monthly:
+                continue
+
+            # Remove obviously bad monthly values for professional UAE roles.
+            # This avoids weird generic/immigration/currency snippets.
+            vals = [v for v in vals if 3000 <= v <= 90000]
+            if not vals:
+                continue
+
+            vals = sorted(vals)
+            if len(vals) >= 2 and vals[0] != vals[1]:
+                candidates.append(f"{format_aed_monthly(vals[0])}–{format_aed_monthly(vals[1]).replace('AED ', '')}")
+            else:
+                candidates.append(format_aed_monthly(vals[0]))
+
+            if len(candidates) >= 2:
+                break
+        if len(candidates) >= 2:
+            break
+
+    # Deduplicate, keep compact.
+    out = []
+    for c in candidates:
+        if c and c not in out:
+            out.append(c)
+    if not out:
+        return None
+    return "; ".join(out[:2])
+
+
+def compact_pay_from_evidence(answer, evidence_text):
+    """Only show clean AED/month values. Otherwise say Unknown."""
+    monthly = normalize_salary_to_monthly(f"{answer} {evidence_text}")
+    return monthly if monthly else "Unknown"
+
+def ai_search_company_pay(company, title, location, search_depth="basic"):
+    """
+    AI/web-search based pay intelligence.
+    No hardcoded salary ranges. Strictly rejects weak/generic salary matches.
+    """
+    api_key = get_tavily_key()
+    if not api_key:
+        return {
+            "Estimated Pay": "Not checked",
+            "Pay Confidence": "No API key",
+            "Pay Evidence": "Add TAVILY_API_KEY.",
+            "Pay Sources": "",
+        }
+
+    try:
+        from tavily import TavilyClient
+    except Exception:
+        return {
+            "Estimated Pay": "Not checked",
+            "Pay Confidence": "Missing package",
+            "Pay Evidence": "Install tavily-python.",
+            "Pay Sources": "",
+        }
+
+    company = normalize_salary_query_text(company)
+    title = normalize_salary_query_text(title)
+    location = normalize_salary_query_text(location)
+
+    if not company and not title:
+        return {
+            "Estimated Pay": "Unknown",
+            "Pay Confidence": "Low",
+            "Pay Evidence": "Company/title unclear.",
+            "Pay Sources": "",
+        }
+
+    query = build_pay_search_query(company, title, location)
+    search_depth = "advanced" if search_depth == "advanced" else "basic"
+
+    try:
+        client = TavilyClient(api_key=api_key)
+        try:
+            response = client.search(
+                query=query,
+                search_depth=search_depth,
+                max_results=7,
+                include_answer=True,
+                include_raw_content=False,
+            )
+        except Exception as first_error:
+            # Retry with a much shorter query, then fail softly as Unknown.
+            query = build_pay_search_query_fallback(company, title)
+            response = client.search(
+                query=query,
+                search_depth="basic",
+                max_results=5,
+                include_answer=True,
+                include_raw_content=False,
+            )
+
+        answer = clean_text(response.get("answer", ""))
+        results = response.get("results", []) or []
+
+        reliable_snippets = []
+        weak_snippets = []
+        source_links = []
+        weak_source_links = []
+
+        for r in results[:7]:
+            result_title = clean_text(r.get("title", ""))
+            content = clean_text(r.get("content", ""))
+            url = r.get("url", "") or ""
+            combined = f"{result_title} {content} {url}"
+
+            salary_ok = has_salary_signal(combined) and bool(extract_salary_mentions(combined))
+            company_ok = text_matches_company(combined, company)
+
+            if salary_ok and company_ok:
+                reliable_snippets.append(compact_table_text(f"{result_title}: {content}", 220))
+                if url:
+                    source_links.append(url)
+            elif has_salary_signal(combined):
+                # Keep weak evidence for review, but never use it to print a salary number.
+                weak_snippets.append(compact_table_text(f"{result_title}: {content}", 160))
+                if url:
+                    weak_source_links.append(url)
+
+        evidence_text = " | ".join(reliable_snippets)
+        estimated_pay = compact_pay_from_evidence(answer if reliable_snippets else "", evidence_text)
+
+        if reliable_snippets and estimated_pay != "Unknown":
+            confidence = "High" if len(reliable_snippets) >= 2 else "Medium"
+            evidence_summary = compact_table_text(evidence_text, 300)
+        elif reliable_snippets:
+            # Found company-specific salary evidence, but no clean AED/month number.
+            confidence = "Medium"
+            estimated_pay = "Review sources"
+            evidence_summary = compact_table_text(evidence_text, 300)
+        elif weak_snippets:
+            # Balanced mode: show that web results existed, but mark them as weak.
+            # This avoids the useless table full of Unknown/No reliable, without inventing pay.
+            confidence = "Low / review"
+            estimated_pay = "Review sources"
+            evidence_summary = compact_table_text("Weak salary matches found; not company-specific enough.", 120)
+            source_links = weak_source_links
+        else:
+            confidence = "Low"
+            estimated_pay = "No public data"
+            evidence_summary = "No reliable public salary data."
+            source_links = []
+
+        return {
+            "Estimated Pay": estimated_pay,
+            "Pay Confidence": confidence,
+            "Pay Evidence": evidence_summary,
+            "Pay Sources": " | ".join(source_links[:3]),
+        }
+
+    except Exception as e:
+        # Do not show API errors as salary in the table. Keep UI clean.
+        return {
+            "Estimated Pay": "Unknown",
+            "Pay Confidence": "Low",
+            "Pay Evidence": "No reliable data.",
+            "Pay Sources": "",
+        }
+
+def get_ai_pay_cached(company, title, location, search_depth="basic"):
+    key = "|".join([
+        normalize_salary_query_text(company).lower(),
+        normalize_salary_query_text(title).lower(),
+        normalize_salary_query_text(location).lower(),
+        search_depth,
+    ])
+
+    if key in st.session_state.pay_cache:
+        return st.session_state.pay_cache[key]
+
+    result = ai_search_company_pay(company, title, location, search_depth=search_depth)
+    st.session_state.pay_cache[key] = result
+    return result
+
 @st.cache_resource(show_spinner=False)
 def load_ai_semantic_model():
     if not AI_SEMANTIC_AVAILABLE:
@@ -759,6 +1121,8 @@ def apply_filters(df, include_words, require_all, exclude_words,
     return df[df["Match Score"] >= min_score]
 if "page_cache" not in st.session_state:
     st.session_state.page_cache = {}
+if "pay_cache" not in st.session_state:
+    st.session_state.pay_cache = {}
 if "last_results" not in st.session_state:
     st.session_state.last_results = None
 if "last_diagnostics" not in st.session_state:
@@ -769,13 +1133,13 @@ if "request_session" not in st.session_state:
     st.session_state.request_session = make_session()
 st.markdown("""
 <div class="hero">
-  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v9.4 · UAE & Middle East</div>
+  <div class="hero-eyebrow">LinkedIn Jobs Hunter · v10.1 · UAE & Middle East</div>
   <div class="hero-title">Find fresh roles.<br><em>Before everyone else.</em></div>
-  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, fast hybrid smart search, Hugging Face AI scoring, persistent seen-list, in-session caching.</div>
+  <div class="hero-sub">Clean LinkedIn scanner with collections, filters, smart matching, Hugging Face AI scoring, persistent seen-list, in-session caching, and AI company pay search.</div>
 </div>
 """, unsafe_allow_html=True)
 seen_count = db_seen_count()
-sc1, sc2, sc3 = st.columns([3, 1, 1])
+sc1, sc2, sc3, sc4 = st.columns([3, 1, 1, 1])
 with sc1:
     if seen_count:
         st.caption(f"📑 {seen_count} jobs in your hidden/seen list (persisted at `~/.jobs_hunter.db`)")
@@ -789,6 +1153,10 @@ with sc3:
     if st.button("Reset seen-list", key="reset_seen_btn"):
         db_clear_seen()
         st.success("Seen-list cleared.")
+with sc4:
+    if st.button("Clear pay AI", key="clear_pay_cache_btn"):
+        st.session_state.pay_cache = {}
+        st.success("AI pay cache cleared.")
 st.markdown('<span class="slabel">01 &nbsp;—&nbsp; Collection</span>', unsafe_allow_html=True)
 collection_options = ["Custom search"] + list(JOB_COLLECTIONS.keys())
 selected_collection = st.radio("collection", collection_options, horizontal=True, label_visibility="collapsed")
@@ -877,6 +1245,29 @@ with st.expander("⚙  Filters & settings"):
         hide_seen = st.checkbox("Hide jobs I already marked as seen", value=True, key="hide_seen")
     with fk:
         show_diagnostics = st.checkbox("Show technical details", value=False, key="diagnostics")
+    pl, pm, pn = st.columns(3)
+    with pl:
+        enable_ai_pay_search = st.checkbox(
+            "AI search company pay",
+            value=False,
+            key="enable_ai_pay_search",
+            help="Searches online salary evidence for company + role. Slower, uses Tavily credits, and caches results.",
+        )
+    with pm:
+        ai_pay_top_n = st.slider(
+            "AI pay checks",
+            1, 20, 10,
+            key="ai_pay_top_n",
+            help="Only checks the top N filtered jobs to keep the app fast and avoid wasting API credits.",
+        )
+    with pn:
+        ai_pay_depth = st.selectbox(
+            "AI pay search depth",
+            ["basic", "advanced"],
+            index=0,
+            key="ai_pay_depth",
+            help="Basic is cheaper/faster. Advanced may find better evidence but can use more credits.",
+        )
 delay_range = DELAY_RANGES[delay_mode]
 keywords = make_keywords(main_query, extra_queries_text, selected_collection, active_keywords)
 include_words = [x.strip() for x in include_text.split(",") if x.strip()]
@@ -896,6 +1287,9 @@ if not AI_SEMANTIC_AVAILABLE:
 else:
     hf_token_status = "token found" if get_hf_token() else "no token needed for public model"
     st.caption(f"🤗 Hugging Face AI search ready · model: all-MiniLM-L6-v2 · {hf_token_status}.")
+
+tavily_status = "ready" if get_tavily_key() else "add TAVILY_API_KEY to enable"
+st.caption(f"💰 AI company pay search: {tavily_status} · cached checks this session: {len(st.session_state.pay_cache)}.")
 st.markdown("<br>", unsafe_allow_html=True)
 def run_search():
     if not keywords:
@@ -999,6 +1393,41 @@ if all_jobs is not None:
         filtered_df = filtered_df.sort_values(
             ["Match Score", "Posted Parsed"], ascending=[False, False], na_position="last",
         )
+
+    # AI company pay search is intentionally applied only after filtering/sorting,
+    # and only to top N jobs, to avoid slow/expensive repeated web searches.
+    pay_columns = ["Estimated Pay", "Pay Confidence", "Pay Evidence", "Pay Sources"]
+    for col in pay_columns:
+        if col not in filtered_df.columns:
+            filtered_df[col] = "Not checked" if col == "Estimated Pay" else ""
+
+    if enable_ai_pay_search:
+        top_pay_df = filtered_df.head(ai_pay_top_n)
+        pay_progress = st.progress(0)
+        pay_status = st.empty()
+
+        for i, (idx, row) in enumerate(top_pay_df.iterrows(), start=1):
+            company_for_pay = row.get("Company", "")
+            title_for_pay = row.get("Title", "")
+            pay_status.markdown(
+                f'<p style="font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#6a8caa;">'
+                f'AI pay search {i}/{len(top_pay_df)}: '
+                f'<span style="color:#1a6bb5;font-weight:600;">{esc_text(company_for_pay)} · {esc_text(title_for_pay)}</span></p>',
+                unsafe_allow_html=True,
+            )
+            pay_info = get_ai_pay_cached(
+                company_for_pay,
+                title_for_pay,
+                row.get("Location", location),
+                search_depth=ai_pay_depth,
+            )
+            for col, value in pay_info.items():
+                filtered_df.loc[idx, col] = value
+            pay_progress.progress(i / max(len(top_pay_df), 1))
+
+        pay_status.empty()
+        pay_progress.empty()
+
     st.markdown('<hr class="sdivider">', unsafe_allow_html=True)
     st.success(
         f"✅ {before_filter} jobs found · {after_filter} matched your filters · "
@@ -1010,10 +1439,21 @@ if all_jobs is not None:
     m3.metric("Collections", filtered_df["Collection"].nunique())
     valid_dates = filtered_df["Posted Parsed"].dropna()
     m4.metric("Newest", valid_dates.iloc[0].strftime("%b %d, %H:%M") if not valid_dates.empty else "N/A")
+    # Final results table is always sorted by posting time, newest first.
+    # Match-score sorting is still used above for choosing top cards / pay-check priority when selected.
+    table_df = filtered_df.sort_values(
+        ["Posted Parsed", "Match Score"], ascending=[False, False], na_position="last",
+    )
+
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown(f'<span class="slabel">Results — {sort_mode}</span>', unsafe_allow_html=True)
-    display_cols = ["Posted Date", "Posted", "Title", "Company", "Location", "URL"]
-    display_df = filtered_df[display_cols].rename(columns={"Title": "Job Title"})
+    st.markdown('<span class="slabel">Results — newest first</span>', unsafe_allow_html=True)
+
+    # Main results table stays clean: no AI pay columns here.
+    # Pay details are shown only in the second AI pay table below.
+    display_cols = [
+        "Posted Date", "Posted", "Title", "Company", "Location", "URL"
+    ]
+    display_df = table_df[display_cols].rename(columns={"Title": "Job Title"})
     st.dataframe(
         display_df,
         use_container_width=True,
@@ -1026,6 +1466,68 @@ if all_jobs is not None:
             )
         },
     )
+
+    if enable_ai_pay_search:
+        with st.expander("💰 AI pay evidence and sources", expanded=True):
+            evidence_cols = [
+                "Title", "Company", "Location", "Estimated Pay",
+                "Pay Confidence", "Pay Evidence", "Pay Sources"
+            ]
+            evidence_df = table_df[evidence_cols].rename(columns={"Title": "Job Title"})
+
+            # Show only useful AI pay rows:
+            # - clean AED/month result, OR
+            # - Review sources with at least one source link.
+            # Hide the useless wall of Unknown / Low / No reliable rows.
+            evidence_df = evidence_df[evidence_df["Estimated Pay"].fillna("").ne("Not checked")].copy()
+            evidence_df["Estimated Pay"] = evidence_df["Estimated Pay"].fillna("")
+            evidence_df["Pay Sources"] = evidence_df["Pay Sources"].fillna("")
+            evidence_df["Pay Evidence"] = evidence_df["Pay Evidence"].fillna("")
+
+            useful_mask = (
+                evidence_df["Estimated Pay"].str.contains("AED", case=False, na=False)
+                | (
+                    evidence_df["Estimated Pay"].eq("Review sources")
+                    & evidence_df["Pay Sources"].str.strip().ne("")
+                )
+            )
+            evidence_df = evidence_df[useful_mask].copy()
+
+            # Keep UI clean: no API/debug/no-data wording in the table.
+            evidence_df["Pay Evidence"] = evidence_df["Pay Evidence"].replace({
+                "Search failed / no reliable evidence.": "",
+                "No reliable salary evidence.": "",
+                "Weak match only — ignored.": "Weak match ignored.",
+                "No reliable data.": "",
+                "No reliable public salary data.": "",
+            })
+            compact_limits = {
+                "Estimated Pay": 45,
+                "Pay Confidence": 25,
+                "Pay Evidence": 65,
+                "Pay Sources": 90,
+            }
+            for col, limit in compact_limits.items():
+                if col in evidence_df.columns:
+                    evidence_df[col] = evidence_df[col].apply(lambda x: compact_table_text(x, limit))
+            if evidence_df.empty:
+                st.info(
+                    "No reliable salary data found for these checked jobs. "
+                    "This usually means salary is not public for the exact company/role. "
+                    "Try Advanced pay search or check fewer top jobs."
+                )
+            else:
+                st.dataframe(
+                    evidence_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Estimated Pay": st.column_config.TextColumn("Estimated Pay", width="small"),
+                        "Pay Confidence": st.column_config.TextColumn("Confidence", width="small"),
+                        "Pay Evidence": st.column_config.TextColumn("Evidence", width="medium"),
+                        "Pay Sources": st.column_config.TextColumn("Sources", width="medium"),
+                    },
+                )
     st.markdown("<br>", unsafe_allow_html=True)
     top_n = min(15, len(filtered_df))
     st.markdown(f'<span class="slabel">Top {top_n} cards</span>', unsafe_allow_html=True)
@@ -1092,6 +1594,6 @@ elif reapply_clicked:
 st.markdown('<hr class="sdivider">', unsafe_allow_html=True)
 st.markdown(
     '<p style="font-size:10px;color:#a8c8e8;letter-spacing:0.16em;text-transform:uppercase;">'
-    'JOBS HUNTER v9.4 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list</p>',
+    'JOBS HUNTER v10.3 &nbsp;·&nbsp; honest scoring · session cache · persistent seen-list · clean AI pay evidence</p>',
     unsafe_allow_html=True,
 )
